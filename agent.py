@@ -12,21 +12,23 @@ from build_db import COMMODITIES, DB_PATH, build, norm
 # Order = priority. Each model has its own free-tier quota, so a longer chain = more capacity.
 MODEL_CHAIN = [
     ("gemini", os.environ.get("GEMINI_MODEL")),
-    ("gemini", "gemini-3.5-flash"),
     ("groq", os.environ.get("GROQ_MODEL")),
     ("groq", "openai/gpt-oss-120b"),
-    ("gemini", "gemini-3.8-flash"),
     ("gemini", "gemini-3.5-flash-lite"),
-    ("groq", "qwen/qwen3.8-27b"),
     ("gemini", "gemini-3.1-flash-lite"),
+    ("groq", "qwen/qwen3.8-27b"),
+    ("gemini", "gemini-3.5-flash"),
     ("groq", "openai/gpt-oss-20b"),
     ("gemini", "gemini-flash-lite-latest"),
+    ("gemini", "gemini-3.8-flash"),
 ]
 MAX_ROWS = 200          # rows returned by run_sql
 ROWS_TO_LLM = 30        # rows shown to the model
 MAX_FEEDBACK_CHARS = 3500
 SQL_TIMEOUT = 15        # seconds
 MAX_STEPS = 6
+TIME_BUDGET = 70        # seconds for one whole answer (jury limit is 90 s)
+CALL_TIMEOUT = 25       # max seconds for one LLM call
 
 NO_DATA = {
     "ru": "В данных нет такой информации.",
@@ -169,7 +171,7 @@ class LLMError(Exception):
     pass
 
 
-def _gemini(messages, model):
+def _gemini(messages, model, timeout=CALL_TIMEOUT):
     key = os.environ.get("GEMINI_API_KEY")
     if not key:
         raise LLMError("no GEMINI_API_KEY")
@@ -181,7 +183,7 @@ def _gemini(messages, model):
         "generationConfig": {"temperature": 0, "responseMimeType": "application/json"},
     }
     r = requests.post(f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
-                      headers={"x-goog-api-key": key}, json=body, timeout=30)
+                      headers={"x-goog-api-key": key}, json=body, timeout=timeout)
     if r.status_code != 200:
         raise LLMError(f"gemini {model} {r.status_code}: {r.text[:200]}")
     try:
@@ -190,14 +192,14 @@ def _gemini(messages, model):
         raise LLMError(f"gemini bad response: {r.text[:200]}") from e
 
 
-def _groq(messages, model):
+def _groq(messages, model, timeout=CALL_TIMEOUT):
     key = os.environ.get("GROQ_API_KEY")
     if not key:
         raise LLMError("no GROQ_API_KEY")
     r = requests.post("https://api.groq.com/openai/v1/chat/completions",
                       headers={"Authorization": f"Bearer {key}"},
                       json={"model": model, "messages": messages, "temperature": 0,
-                            "response_format": {"type": "json_object"}}, timeout=45)
+                            "response_format": {"type": "json_object"}}, timeout=timeout)
     if r.status_code != 200:
         raise LLMError(f"groq {model} {r.status_code}: {r.text[:200]}")
     return r.json()["choices"][0]["message"]["content"]
@@ -207,16 +209,21 @@ PROVIDERS = [(n, _gemini if n == "gemini" else _groq, m) for n, m in MODEL_CHAIN
 _dead_until = {}  # provider/model -> timestamp when to retry
 
 
-def chat(messages, max_wait=40):
-    """Try providers in order; on rate limits wait (up to max_wait s in total) and retry."""
+def chat(messages, deadline=None, max_wait=40):
+    """Try providers in order; on rate limits wait (up to max_wait s in total) and retry.
+    Never runs past `deadline` (epoch seconds)."""
+    deadline = deadline or time.time() + TIME_BUDGET
     errors = []
     waited = 0
     while True:
         for name, fn, model in PROVIDERS:
             if _dead_until.get(model, 0) > time.time():
                 continue
+            left = deadline - time.time()
+            if left < 4:
+                raise LLMError("time budget exhausted; " + "; ".join(errors[-2:]))
             try:
-                return fn(messages, model), f"{name}:{model}"
+                return fn(messages, model, timeout=min(CALL_TIMEOUT, left - 1)), f"{name}:{model}"
             except (LLMError, requests.RequestException) as e:
                 se = str(e)
                 errors.append(se)
@@ -227,6 +234,8 @@ def chat(messages, max_wait=40):
         if not alive_at or waited >= max_wait:
             raise LLMError("; ".join(errors[-4:]) or "no LLM available")
         pause = max(1.0, min(min(alive_at) - time.time(), max_wait - waited))
+        if time.time() + pause > deadline - 10:
+            raise LLMError("time budget exhausted; " + "; ".join(errors[-2:]))
         time.sleep(pause)
         waited += pause
 
@@ -351,6 +360,43 @@ def mixes_units(sql):
     return not re.search(r"\bunit\b", s)
 
 
+def all_empty(evidence):
+    """True if no query returned any meaningful value (no rows, or only NULL / 0)."""
+    for _, _, rows in evidence:
+        for row in rows:
+            if any(v not in (None, 0, 0.0, "") for v in row):
+                return False
+    return True
+
+
+QUOTE_RE = re.compile(r'«([^»]{2,120})»|“([^”]{2,120})”|„([^“”]{2,120})[“”]|"([^"]{2,120})"')
+_ALWAYS_OK = None
+
+
+def check_names(answer_text, evidence):
+    """Every quoted name in the answer must occur in the query results or SQL (after norm())."""
+    global _ALWAYS_OK
+    if _ALWAYS_OK is None:
+        _ALWAYS_OK = norm(" ".join(c for c, _ in COMMODITIES) + " Аннулирован(Не оплачен) Исполнен(Частично) "
+                          "Ждёт оплату Не подписан Заключен Оплачен Исполнен Новый Внутренний Экспортный "
+                          "Спот Форвард Фьючерс Английский аукцион Обратный аукцион Двусторонний аукцион")
+    hay = [_ALWAYS_OK]
+    for sql, cols, rows in evidence:
+        hay.append(norm(sql))
+        for row in rows:
+            hay.extend(norm(v) for v in row if isinstance(v, str))
+    hay = "|".join(h for h in hay if h)
+    bad = []
+    for m in QUOTE_RE.finditer(answer_text):
+        name = next(g for g in m.groups() if g)
+        key = norm(name)
+        if len(key) < 3 or not re.search(r"[a-z]", key):
+            continue
+        if key not in hay:
+            bad.append(name)
+    return bad
+
+
 # ---------------------------------------------------------------- main loop
 def fmt_rows(cols, rows, truncated, limit=ROWS_TO_LLM):
     if not rows:
@@ -383,10 +429,11 @@ def answer(question, con=None):
     ]
     model = None
     verify_retries = 0
+    deadline = time.time() + TIME_BUDGET
     try:
         for _ in range(MAX_STEPS + 3):
             t0 = time.time()
-            text, model = chat(messages)
+            text, model = chat(messages, deadline=deadline)
             log.append(f"{model} {time.time() - t0:.1f}s")
             msg = parse_json(text)
             messages.append({"role": "assistant", "content": json.dumps(msg, ensure_ascii=False)})
@@ -416,19 +463,26 @@ def answer(question, con=None):
                     return dict(answer=NO_DATA[lang], lang=lang, evidence=[], model=model, verified=True, log=log)
                 messages.append({"role": "user", "content": "You must run at least one SQL query before answering."})
                 continue
+            if final.strip() in NO_DATA.values():
+                return dict(answer=NO_DATA[lang], lang=lang, evidence=evidence, model=model, verified=True, log=log)
+            if all_empty(evidence):
+                # nothing was found in the data -> never let the model name anything
+                log.append("empty-result guard: all queries returned nothing")
+                return dict(answer=NO_DATA[lang], lang=lang, evidence=evidence, model=model, verified=True, log=log)
             all_rows = [(c, r) for _, c, r in evidence]
-            bad = verify(final, question, all_rows)
+            bad = verify(final, question, all_rows) + check_names(final, evidence)
             if not bad:
                 return dict(answer=final, lang=lang, evidence=evidence, model=model, verified=True, log=log)
-            log.append(f"verifier: numbers not found in results: {bad}")
+            log.append(f"verifier: not found in results: {bad}")
             if verify_retries >= 2:
                 note = " (проверка не пройдена)" if lang == "ru" else " (tekshiruvdan o‘tmadi)"
                 return dict(answer=NO_DATA[lang] + note, lang=lang, evidence=evidence, model=model,
                             verified=False, log=log)
             verify_retries += 1
             messages.append({"role": "user", "content":
-                             f"VERIFICATION FAILED: these numbers are not in the SQL results: {bad}. "
-                             "Every number must come from a query result. Run another query if needed "
+                             f"VERIFICATION FAILED: these numbers/names are not in the SQL results: {bad}. "
+                             "Every number and every company/product name must come from a query result. "
+                             "Run another query if needed "
                              "(do the calculation in SQL), then answer again."})
         return dict(answer=NO_DATA[lang], lang=lang, evidence=evidence, model=model, verified=False, log=log)
     except LLMError as e:
