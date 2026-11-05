@@ -47,6 +47,11 @@ html, body, .stApp, [class*="css"], .stMarkdown, button, input, textarea { font-
 [data-testid="stSidebar"] .stButton button:hover { border-color: var(--green); color: var(--green); }
 
 [data-testid="stChatMessage"] { background: var(--card); border: 1px solid #252b63; border-radius: 0; padding: 1rem 1.1rem; }
+/* question: lighter card with lavender accent; answer: darker card with green accent */
+[data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) {
+  background: #1F2663; border: 1px solid #343d8a; border-left: 3px solid var(--lav); }
+[data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarAssistant"]) {
+  background: #0D1033; border: 1px solid #1f2558; border-left: 3px solid var(--green); }
 [data-testid="stChatMessageAvatarUser"] { background: var(--lav) !important; color: var(--navy) !important; border-radius: 0 !important; }
 [data-testid="stChatMessageAvatarAssistant"] { background: var(--green) !important; color: var(--navy) !important; border-radius: 0 !important; }
 [data-testid="stExpander"] details { border-radius: 0; border-color: #2b3270; }
